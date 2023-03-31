@@ -5,3 +5,4 @@ fmem.ko
 fmem.mod
 fmem.mod.c
 modules.order
+devmem2
