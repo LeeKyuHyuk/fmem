@@ -289,6 +289,53 @@ static ssize_t write_mem(struct file *file, const char __user *buf,
   return written;
 }
 
+int __weak phys_mem_access_prot_allowed(struct file *file, unsigned long pfn,
+                                        unsigned long size,
+                                        pgprot_t *vma_prot) {
+  return 1;
+}
+
+/*
+ * Architectures vary in how they handle caching for addresses
+ * outside of main memory.
+ *
+ */
+static int uncached_access(struct file *file, phys_addr_t addr) {
+#if defined(CONFIG_IA64)
+  /*
+   * On ia64, we ignore O_DSYNC because we cannot tolerate memory
+   * attribute aliases.
+   */
+  return !(efi_mem_attributes(addr) & EFI_MEMORY_WB);
+#elif defined(CONFIG_MIPS)
+  {
+    extern int __uncached_access(struct file * file, unsigned long addr);
+
+    return __uncached_access(file, addr);
+  }
+#else
+  /*
+   * Accessing memory above the top the kernel knows about or through a
+   * file pointer
+   * that was marked O_DSYNC will be done non-cached.
+   */
+  if (file->f_flags & O_DSYNC)
+    return 1;
+  return addr >= __pa(high_memory);
+#endif
+}
+
+pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
+                              unsigned long size, pgprot_t vma_prot) {
+#ifdef pgprot_noncached
+  phys_addr_t offset = pfn << PAGE_SHIFT;
+
+  if (uncached_access(file, offset))
+    return pgprot_noncached(vma_prot);
+#endif
+  return vma_prot;
+}
+
 #ifndef CONFIG_MMU
 static unsigned long
 get_unmapped_area_mem(struct file *file, unsigned long addr, unsigned long len,
@@ -308,7 +355,46 @@ static inline int private_mapping_ok(struct vm_area_struct *vma) {
 static inline int private_mapping_ok(struct vm_area_struct *vma) { return 1; }
 #endif
 
-static int mmap_mem(struct file *file, struct vm_area_struct *vma) { return 0; }
+static const struct vm_operations_struct mmap_mem_ops = {
+#ifdef CONFIG_HAVE_IOREMAP_PROT
+    .access = generic_access_phys
+#endif
+};
+
+static int mmap_mem(struct file *file, struct vm_area_struct *vma) {
+  size_t size = vma->vm_end - vma->vm_start;
+  phys_addr_t offset = (phys_addr_t)vma->vm_pgoff << PAGE_SHIFT;
+
+  /* Does it even fit in phys_addr_t? */
+  if (offset >> PAGE_SHIFT != vma->vm_pgoff)
+    return -EINVAL;
+
+  /* It's illegal to wrap around the end of the physical address space. */
+  if (offset + (phys_addr_t)size - 1 < offset)
+    return -EINVAL;
+
+  if (!valid_mmap_phys_addr_range(vma->vm_pgoff, size))
+    return -EINVAL;
+
+  if (!private_mapping_ok(vma))
+    return -ENOSYS;
+
+  if (!phys_mem_access_prot_allowed(file, vma->vm_pgoff, size,
+                                    &vma->vm_page_prot))
+    return -EINVAL;
+
+  vma->vm_page_prot =
+      phys_mem_access_prot(file, vma->vm_pgoff, size, vma->vm_page_prot);
+
+  vma->vm_ops = &mmap_mem_ops;
+
+  /* Remap-pfn-range will mark the range VM_IO */
+  if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, size,
+                      vma->vm_page_prot)) {
+    return -EAGAIN;
+  }
+  return 0;
+}
 
 /*
  * The memory devices use the full 32/64 bits of the offset, and so we cannot
@@ -321,11 +407,7 @@ static int mmap_mem(struct file *file, struct vm_area_struct *vma) { return 0; }
 static loff_t memory_lseek(struct file *file, loff_t offset, int orig) {
   loff_t ret;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
-  mutex_lock(&file->f_path.dentry->d_inode->i_mutex);
-#else
   inode_lock(file->f_path.dentry->d_inode);
-#endif
 
   switch (orig) {
   case 0:
@@ -341,11 +423,7 @@ static loff_t memory_lseek(struct file *file, loff_t offset, int orig) {
   default:
     ret = -EINVAL;
   }
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
-  mutex_unlock(&file->f_path.dentry->d_inode->i_mutex);
-#else
   inode_unlock(file->f_path.dentry->d_inode);
-#endif
   return ret;
 }
 
@@ -414,51 +492,12 @@ static int __init chr_dev_init(void) {
   return 0;
 }
 
-/*
-   Function that gets addresses for functions, we need for /dev/fmem.
-   (page_is_ram)
-
-   Change implementation, if you need.
-   version 1.- Use kprobes to find kallsyms_lookup_name() location for 5.7.0+
-   kernels. version 2.- Use kallsyms_on_each_symbol() for kernels 2.6.30 and
-   newer. version 3.- Get value by yourself, and give it to module as parameter.
-*/
-
-//----------------------------------------------------------------------------------
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
-
 static int kallsyms_kprobe_handler(struct kprobe *p_ri,
                                    struct pt_regs *p_regs) {
   return 0;
 }
 
-#else
-
-static int kallsyms_on_each_symbol_callback(void *data, const char *name,
-                                            struct module *module,
-                                            unsigned long addr) {
-  if (strcmp(name, "page_is_ram") == 0 && module == NULL) {
-    dbgprint("set guess_page_is_ram: %#lx, %p", addr, module);
-    guess_page_is_ram = (void *)addr;
-  }
-  if (strcmp(name, "unxlate_dev_mem_ptr") == 0 && module == NULL) {
-    dbgprint("set guess_unxlate_dev_mem_ptr: %#lx, %p", addr, module);
-    // guess_unxlate_dev_mem_ptr = (void *) addr;
-  }
-  return 0;
-}
-
-#endif
-
 int find_symbols(void) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
-  /* version 1:
-  This works on kernel 5.7.0 and newer where kallsyms_lookup_name()
-  and kallsyms_on_each_symbol() are not exported.
-  The idea is taken from LTTng module, see https://lkml.org/lkml/2020/5/5/478
-  https://github.com/lttng/lttng-modules/blob/master/src/wrapper/kallsyms.c
-  */
   unsigned long (*p_kallsyms_lookup_name)(const char *name) = 0, addr;
   struct kprobe kp;
   int ret;
@@ -482,19 +521,6 @@ int find_symbols(void) {
   dbgprint("set guess_page_is_ram: %#lx", addr);
   guess_page_is_ram = (void *)addr;
 
-#else
-
-  /* version 2:
-  This works only on 2.6.30 and newer, but does not require ugly /proc/kallsyms
-  hack.
-  */
-  kallsyms_on_each_symbol(kallsyms_on_each_symbol_callback, NULL);
-
-#endif
-
-  /* version 3:
-  Take address from command line passed there by grepping /proc/kallsyms.
-  */
   if (!guess_page_is_ram) {
     guess_page_is_ram = (void *)page_is_ram_addr;
     dbgprint("set guess_page_is_ram: %p", guess_page_is_ram);
@@ -513,12 +539,14 @@ int __init init_module(void) {
   chr_dev_init();
   return 0;
 #else
+  dbgprint("fmem is supported starting with Linux Kernel v5.8.0 or higher.");
   return 1;
 #endif
 }
 
 /// Function executed when unloading module
 void __exit cleanup_module(void) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
   dbgprint("destroying fmem device");
 
   // Clean up
@@ -527,4 +555,7 @@ void __exit cleanup_module(void) {
   class_destroy(mem_class);
 
   dbgprint("exit");
+#else
+  dbgprint("fmem is supported starting with Linux Kernel v5.8.0 or higher.");
+#endif
 }
