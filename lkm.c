@@ -58,7 +58,7 @@ MODULE_LICENSE("GPL");
 // function page_is_ram is not exported
 // for modules, but is available in kallsyms.
 // So we need determine this address using dirty tricks
-int (*guess_page_is_ram)(unsigned long pagenr);
+int (*guess_page_is_ram)(phys_addr_t pagenr);
 
 // when parsing addresses trough parameters
 unsigned long page_is_ram_addr = 0;
@@ -66,6 +66,21 @@ module_param(page_is_ram_addr, ulong, 0); // address of page_is_ram function
 
 // Char we show before each debug print
 const char program_name[] = "fmem";
+
+static inline unsigned long size_inside_page(unsigned long start,
+                                             unsigned long size) {
+  unsigned long sz;
+
+  sz = PAGE_SIZE - (start & (PAGE_SIZE - 1));
+
+  return min(sz, size);
+}
+
+int valid_phys_addr_range(phys_addr_t addr, size_t count) {
+  return addr + count <= __pa(high_memory);
+}
+
+int valid_mmap_phys_addr_range(unsigned long pfn, size_t size) { return 1; }
 
 /* Own implementation of xlate_dev_mem_ptr
  * (so we can read highmem and other)
@@ -75,10 +90,10 @@ const char program_name[] = "fmem";
  *         physical address is mapped
  */
 
-void *my_xlate_dev_mem_ptr(unsigned long phys) {
+void *my_xlate_dev_mem_ptr(phys_addr_t phys) {
   void *addr = NULL;
-  unsigned long start = phys & PAGE_MASK;
-  unsigned long pfn = PFN_DOWN(phys);
+  phys_addr_t start = phys & PAGE_MASK;
+  phys_addr_t pfn = PFN_DOWN(phys);
 
   /* If page is RAM, we can use __va. Otherwise ioremap and unmap. */
   if ((*guess_page_is_ram)(start >> PAGE_SHIFT)) {
@@ -93,14 +108,14 @@ void *my_xlate_dev_mem_ptr(unsigned long phys) {
   // Not RAM, so it is some device (can be bios for example)
   addr = (void __force *)ioremap_cache(start, PAGE_SIZE);
   if (addr)
-    addr = (void *)((unsigned long)addr | (phys & ~PAGE_MASK));
+    addr = (void *)((phys_addr_t)addr | (phys & ~PAGE_MASK));
   return addr;
 }
 
 // Our own implementation of unxlate_dev_mem_ptr
 // (so we can read highmem and other)
-void my_unxlate_dev_mem_ptr(unsigned long phys, void *addr) {
-  unsigned long pfn = PFN_DOWN(phys); // get page number
+void my_unxlate_dev_mem_ptr(phys_addr_t phys, void *addr) {
+  phys_addr_t pfn = PFN_DOWN(phys); // get page number
 
   /* If page is RAM, check for highmem, and eventualy do nothing.
      Otherwise need to iounmap. */
@@ -118,6 +133,12 @@ void my_unxlate_dev_mem_ptr(unsigned long phys, void *addr) {
   iounmap((void __iomem *)((unsigned long)addr & PAGE_MASK));
 }
 
+static inline bool should_stop_iteration(void) {
+  if (need_resched())
+    cond_resched();
+  return fatal_signal_pending(current);
+}
+
 /*-- original (stripped) linux/drivers/char/mem.c starts here ---
    only one mem device (fmem) was left
    only read operation is supported
@@ -125,61 +146,30 @@ void my_unxlate_dev_mem_ptr(unsigned long phys, void *addr) {
   --------------------------------------------------------------*/
 
 /*
- * Architectures vary in how they handle caching for addresses
- * outside of main memory.
- *
- */
-static inline int uncached_access(struct file *file, unsigned long addr) {
-#if defined(CONFIG_IA64)
-  /*
-   * On ia64, we ignore O_SYNC because we cannot tolerate memory attribute
-   * aliases.
-   */
-  return !(efi_mem_attributes(addr) & EFI_MEMORY_WB);
-#elif defined(CONFIG_MIPS)
-  {
-    extern int __uncached_access(struct file * file, unsigned long addr);
-    return __uncached_access(file, addr);
-  }
-#else
-  /*
-   * Accessing memory above the top the kernel knows about or through a file
-   * pointer that was marked O_SYNC will be done non-cached.
-   */
-  if (file->f_flags & O_SYNC)
-    return 1;
-  return addr >= __pa(high_memory);
-#endif
-}
-
-/*
- * This function reads the *physical* memory. The f_pos points directly to the
+ * This funcion reads the *physical* memory. The f_pos points directly to the
  * memory location.
  */
 static ssize_t read_mem(struct file *file, char __user *buf, size_t count,
                         loff_t *ppos) {
-  unsigned long p = *ppos;
+  phys_addr_t p = *ppos;
   ssize_t read, sz;
-  char *ptr;
-  u8 *bounce_buffer = (u8 *)kmalloc(PAGE_SIZE, GFP_KERNEL);
-  ssize_t return_value;
+  void *ptr;
+  char *bounce;
+  int err;
 
-  //	if (!valid_phys_addr_range(p, count))  //good bye;)
-  //		return -EFAULT;
-  //	XXX solve here problem of RAM maximum?
+  if (p != *ppos)
+    return 0;
 
+  if (!valid_phys_addr_range(p, count))
+    return -EFAULT;
   read = 0;
 #ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
   /* we don't have page 0 mapped on sparc and m68k.. */
   if (p < PAGE_SIZE) {
-    sz = PAGE_SIZE - p;
-    if (sz > count)
-      sz = count;
+    sz = size_inside_page(p, count);
     if (sz > 0) {
-      if (clear_user(buf, sz)) {
-        return_value = -EFAULT;
-        goto tear_down;
-      }
+      if (clear_user(buf, sz))
+        return -EFAULT;
       buf += sz;
       p += sz;
       count -= sz;
@@ -188,58 +178,115 @@ static ssize_t read_mem(struct file *file, char __user *buf, size_t count,
   }
 #endif
 
+  bounce = kmalloc(PAGE_SIZE, GFP_KERNEL);
+  if (!bounce)
+    return -ENOMEM;
+
   while (count > 0) {
-    /*
-     * Handle first page in case it's not aligned
-     */
-    if (-p & (PAGE_SIZE - 1))
-      sz = -p & (PAGE_SIZE - 1);
-    else
-      sz = PAGE_SIZE;
+    unsigned long remaining;
+    int probe;
 
-    sz = min_t(unsigned long, sz, count);
+    sz = size_inside_page(p, count);
 
+    err = -EFAULT;
     /*
      * On ia64 if a page has been mapped somewhere as
      * uncached, then it must also be accessed uncached
-     * by the kernel or data corruption may occur
+     * by the kernel or data corruption may occur.
      */
     ptr = my_xlate_dev_mem_ptr(p);
+    if (!ptr)
+      goto failed;
 
-    if (!ptr) {
-      dbgprint("xlate FAIL, p: %lX", p);
-      return_value = -EFAULT;
-      goto tear_down;
-    }
-
-    // First copy to bounce buffer and then to user.
-    memcpy(bounce_buffer, ptr, sz);
-    if (copy_to_user(buf, bounce_buffer, sz)) {
-      dbgprint("copy_to_user FAIL, ptr: %p", ptr);
-      my_unxlate_dev_mem_ptr(p, ptr);
-      return_value = -EFAULT;
-      goto tear_down;
-    }
-
+    probe = copy_from_kernel_nofault(bounce, ptr, sz);
     my_unxlate_dev_mem_ptr(p, ptr);
+    if (probe)
+      goto failed;
+
+    remaining = copy_to_user(buf, bounce, sz);
+
+    if (remaining)
+      goto failed;
 
     buf += sz;
     p += sz;
     count -= sz;
     read += sz;
+    if (should_stop_iteration())
+      break;
   }
+  kfree(bounce);
 
   *ppos += read;
-  return_value = read;
+  return read;
 
-tear_down:
-  kfree(bounce_buffer);
-  return return_value;
+failed:
+  kfree(bounce);
+  return err;
 }
 
 static ssize_t write_mem(struct file *file, const char __user *buf,
                          size_t count, loff_t *ppos) {
-  return -EROFS;
+  phys_addr_t p = *ppos;
+  ssize_t written, sz;
+  unsigned long copied;
+  void *ptr;
+
+  if (p != *ppos)
+    return -EFBIG;
+
+  if (!valid_phys_addr_range(p, count))
+    return -EFAULT;
+
+  written = 0;
+
+#ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
+  /* we don't have page 0 mapped on sparc and m68k.. */
+  if (p < PAGE_SIZE) {
+    sz = size_inside_page(p, count);
+    /* Hmm. Do something? */
+    buf += sz;
+    p += sz;
+    count -= sz;
+    written += sz;
+  }
+#endif
+
+  while (count > 0) {
+    sz = size_inside_page(p, count);
+
+    /* Skip actual writing when a page is marked as restricted. */
+    /*
+     * On ia64 if a page has been mapped somewhere as
+     * uncached, then it must also be accessed uncached
+     * by the kernel or data corruption may occur.
+     */
+    ptr = my_xlate_dev_mem_ptr(p);
+    if (!ptr) {
+      if (written)
+        break;
+      return -EFAULT;
+    }
+
+    copied = copy_from_user(ptr, buf, sz);
+    my_unxlate_dev_mem_ptr(p, ptr);
+    if (copied) {
+      written += sz - copied;
+      if (written)
+        break;
+      return -EFAULT;
+    }
+
+    buf += sz;
+    p += sz;
+    count -= sz;
+    written += sz;
+    if (should_stop_iteration())
+      break;
+  }
+
+  *ppos += written;
+  return written;
 }
 
 #ifndef CONFIG_MMU
@@ -458,12 +505,16 @@ int find_symbols(void) {
 
 /// Function executed upon loading module
 int __init init_module(void) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
   dbgprint("init");
   find_symbols();
 
   // Create device itself (/dev/fmem)
   chr_dev_init();
   return 0;
+#else
+  return 1;
+#endif
 }
 
 /// Function executed when unloading module
