@@ -51,8 +51,6 @@ static struct kprobe kp = {.symbol_name = "kallsyms_lookup_name"};
 #define FMEM_MAJOR 341
 #define FMEM_MINOR 1
 
-MODULE_LICENSE("GPL");
-
 // dirty global variables;
 
 // function page_is_ram is not exported
@@ -516,7 +514,7 @@ int find_symbols(void) {
 }
 
 /// Function executed upon loading module
-int __init init_module(void) {
+int __init fmem_init(void) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
   dbgprint("init");
   find_symbols();
@@ -531,7 +529,7 @@ int __init init_module(void) {
 }
 
 /// Function executed when unloading module
-void __exit cleanup_module(void) {
+void __exit fmem_cleanup(void) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0))
   dbgprint("destroying fmem device");
 
@@ -545,3 +543,10 @@ void __exit cleanup_module(void) {
   dbgprint("fmem is supported starting with Linux Kernel v5.8.0 or higher.");
 #endif
 }
+
+module_init(fmem_init);
+module_exit(fmem_cleanup);
+
+MODULE_DESCRIPTION("Linux Kernel Module designed to help analyze volatile "
+                   "memory in the linux kernel");
+MODULE_LICENSE("GPL");
