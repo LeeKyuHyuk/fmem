@@ -21,7 +21,7 @@
 #include <linux/highmem.h>
 #include <linux/init.h>
 #include <linux/kallsyms.h>
-#include <linux/kprobes.h>
+#include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -33,13 +33,13 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 
-#include "debug.h"
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 0)
-#include <linux/bootmem.h>
-#else
-#include <linux/memblock.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#define KPROBE_LOOKUP 1
+#include <linux/kprobes.h>
+static struct kprobe kp = {.symbol_name = "kallsyms_lookup_name"};
 #endif
+
+#include "debug.h"
 
 #ifdef CONFIG_IA64
 #include <linux/efi.h>
@@ -492,32 +492,18 @@ static int __init chr_dev_init(void) {
   return 0;
 }
 
-static int kallsyms_kprobe_handler(struct kprobe *p_ri,
-                                   struct pt_regs *p_regs) {
-  return 0;
-}
-
 int find_symbols(void) {
-  unsigned long (*p_kallsyms_lookup_name)(const char *name) = 0, addr;
-  struct kprobe kp;
-  int ret;
+  unsigned long addr;
 
-  memset(&kp, 0, sizeof(kp));
-  kp.pre_handler = kallsyms_kprobe_handler;
-  kp.symbol_name = "kallsyms_lookup_name";
-  if ((ret = register_kprobe(&kp)) < 0)
-    dbgprint("register_kprobe error: %d\n", ret);
-  p_kallsyms_lookup_name = (void *)kp.addr;
-
-#ifdef CONFIG_ARM
-#ifdef CONFIG_THUMB2_KERNEL
-  if (p_kallsyms_lookup_name)
-    p_kallsyms_lookup_name |= 1; /* set bit 0 in address for thumb mode */
-#endif
-#endif
+#ifdef KPROBE_LOOKUP
+  typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+  kallsyms_lookup_name_t kallsyms_lookup_name;
+  register_kprobe(&kp);
+  kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
   unregister_kprobe(&kp);
+#endif
 
-  addr = p_kallsyms_lookup_name("page_is_ram");
+  addr = kallsyms_lookup_name("page_is_ram");
   dbgprint("set guess_page_is_ram: %#lx", addr);
   guess_page_is_ram = (void *)addr;
 
